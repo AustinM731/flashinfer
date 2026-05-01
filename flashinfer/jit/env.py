@@ -205,6 +205,10 @@ elif IS_HIP:
         return _package_root / "data" / "aot"
 
     def _get_workspace_dir_name() -> pathlib.Path:
+        # Allow no-GPU environments (Docker build, CI) to import flashinfer.
+        # On first real run the JIT workspace is created lazily.
+        if os.environ.get("FLASHINFER_DISABLE_VERSION_CHECK", "0") == "1":
+            return FLASHINFER_CACHE_DIR / flashinfer_version / "noarch"
         try:
             import torch
 

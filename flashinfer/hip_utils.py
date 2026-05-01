@@ -308,8 +308,10 @@ def validate_flashinfer_rocm_arch(
     import os
 
     # Get architecture list from parameter, env var, or default
+    # Include gfx1201 so builds targeting RDNA4 alone don't fail when gfx942
+    # is absent from PyTorch's compiled arch flags (e.g. gfx1201-only image).
     if arch_list is None:
-        arch_list = os.environ.get("FLASHINFER_ROCM_ARCH_LIST", "gfx942")
+        arch_list = os.environ.get("FLASHINFER_ROCM_ARCH_LIST", "gfx942,gfx950,gfx1201")
 
     # Step 1: Validate against system ROCm version (reuse existing logic)
     validated_arch_list = validate_rocm_arch(arch_list=arch_list, verbose=verbose)
