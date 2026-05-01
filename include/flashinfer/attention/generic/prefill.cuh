@@ -109,11 +109,14 @@ struct KernelTraits {
   static_assert(sizeof(DTypeKV_) != 1, "8-bit types not supported for CDNA3");
 
   using SmemBasePtrTy = uint2;
-  static constexpr uint32_t NUM_THREADS = NUM_WARPS_Q * NUM_WARPS_KV * 64;
-  static constexpr uint32_t WARP_THREAD_ROWS = 4;
+  // NUM_THREADS scales with warp size: 64 for CDNA MFMA, 32 for RDNA4 WMMA.
+  static constexpr uint32_t NUM_THREADS = NUM_WARPS_Q * NUM_WARPS_KV * WARP_SIZE;
+  // WMMA (RDNA4, 32 threads): 2 rows × 16 cols; MFMA (CDNA, 64 threads): 4 rows × 16 cols.
+  static constexpr uint32_t WARP_THREAD_ROWS = WARP_SIZE / 16;
   static constexpr uint32_t WARP_THREAD_COLS = 16;
-  static constexpr uint32_t HALF_ELEMS_PER_THREAD = 4;
-  static constexpr uint32_t INT32_ELEMS_PER_THREAD = 2;
+  // 256 elements per 16×16 tile; CDNA: 256/64=4, WMMA: 256/32=8.
+  static constexpr uint32_t HALF_ELEMS_PER_THREAD = 256 / WARP_SIZE;
+  static constexpr uint32_t INT32_ELEMS_PER_THREAD = HALF_ELEMS_PER_THREAD / 2;
   static constexpr uint32_t VECTOR_BIT_WIDTH = HALF_ELEMS_PER_THREAD * 16;
 
   // k128B_16Row extends the XOR period from 8 to 16, eliminating the 8-way
@@ -127,16 +130,16 @@ struct KernelTraits {
   static constexpr uint32_t KV_THR_LAYOUT_COL = WARP_THREAD_COLS;
   // FIXME: [The comment is not correct] The constant is defined based on the
   // matrix layout of the "D/C" accumulator matrix in a D = A*B+C computation.
-  // On CDNA3 the D/C matrices are distributed as four 4x16 bands across the
-  // 64 threads. Each thread owns one element from four different rows.
-  static constexpr uint32_t NUM_ACCUM_ROWS_PER_THREAD = 4;
+  // CDNA3 (64 threads): 4 elements/thread, 4 accum rows.
+  // RDNA4 WMMA (32 threads): 8 elements/thread, 8 accum rows.
+  static constexpr uint32_t NUM_ACCUM_ROWS_PER_THREAD = HALF_ELEMS_PER_THREAD;
   // Number of threads that collaboratively handle the same set of matrix rows
   // in attention score computation and cross-warp synchronization.
   // CDNA3: 16 threads (each thread handles 1 element from same row group)
   static constexpr uint32_t THREADS_PER_BMATRIX_ROW_SET = 16;
   // controls the indexing stride used in logits-related functions
   // (logits_transform, logits_mask, and LSE writing).
-  static constexpr uint32_t LOGITS_INDEX_STRIDE = 4;
+  static constexpr uint32_t LOGITS_INDEX_STRIDE = HALF_ELEMS_PER_THREAD / 2;
   static constexpr uint32_t UPCAST_STRIDE_Q =
       HEAD_DIM_QK / upcast_size<DTypeQ_, VECTOR_BIT_WIDTH>();
   static constexpr uint32_t UPCAST_STRIDE_K =

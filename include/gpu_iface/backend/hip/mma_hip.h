@@ -14,6 +14,11 @@ using f16 = _Float16;
 using f16x4 = f16 __attribute__((ext_vector_type(4)));
 using f32x4 = float __attribute__((ext_vector_type(4)));
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+using f16x8 = f16 __attribute__((ext_vector_type(8)));
+using f32x8 = float __attribute__((ext_vector_type(8)));
+#endif
+
 }  // namespace
 
 namespace flashinfer {
@@ -23,6 +28,7 @@ namespace hip {
 
 #define FLASHINFER_RUNTIME_ASSERT(x) assert(0 && x)
 
+#if !defined(__gfx1201__)
 /// @brief Transposes a 4x4 matrix of `half` values held across a quad of 4 threads.
 /// @details This function operates on a group of 4 consecutive threads (a quad). It assumes
 ///          each thread holds 4 `half` values, which together form a 4x4 matrix where each
@@ -130,14 +136,22 @@ __device__ __forceinline__ void transpose_mma_tile(uint32_t* R) {
   transpose_intra_quad_fragments(R);
   transpose_inter_quad_fragments(R);
 }
+#endif  // !defined(__gfx1201__) — CDNA-only transpose functions
 
-// Single unified load function for all fragment types
-/// @param R [in] pointer to the register file to load the fragment into
-/// @param smem_ptr [in] pointer to the shared memory to load the fragment from
+// Load a 16x16 mmatrix fragment from shared memory into registers.
+// CDNA (MFMA):  2 uint32_t  (4 fp16 elements per thread, 64-thread wavefront)
+// RDNA4 (WMMA): 4 uint32_t  (8 fp16 elements per thread, 32-thread wavefront)
 template <typename T>
 __device__ __forceinline__ void load_fragment(uint32_t* R, const T* smem_ptr) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
   R[0] = reinterpret_cast<const uint32_t*>(smem_ptr)[0];
   R[1] = reinterpret_cast<const uint32_t*>(smem_ptr)[1];
+  R[2] = reinterpret_cast<const uint32_t*>(smem_ptr)[2];
+  R[3] = reinterpret_cast<const uint32_t*>(smem_ptr)[3];
+#else
+  R[0] = reinterpret_cast<const uint32_t*>(smem_ptr)[0];
+  R[1] = reinterpret_cast<const uint32_t*>(smem_ptr)[1];
+#endif
 }
 
 // MMA operation for FP16 inputs with FP32 accumulator
@@ -145,11 +159,10 @@ template <typename T, mma::MMAMode mma_mode = mma::MMAMode::kInplaceUpdate>
 __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, uint32_t* A,
                                                                      uint32_t* B) {
 #if defined(__HIP_DEVICE_COMPILE__) && (__gfx90a__ || __gfx908__ || __gfx942__ || __gfx950__)
-  // Ensure T is either __half or __hip_bfloat16
+  // CDNA MFMA path (64-thread wavefront)
   static_assert(std::is_same_v<T, __half> || std::is_same_v<T, __hip_bfloat16>,
                 "T must be __half or __hip_bfloat16");
 
-  // Initialize C if requested
   if constexpr (mma_mode == mma::MMAMode::kInit) {
     C[0] = 0.0f;
     C[1] = 0.0f;
@@ -168,50 +181,89 @@ __device__ __forceinline__ void mma_sync_m16n16k16_row_col_f16f16f32(float* C, u
   }
 
   reinterpret_cast<f32x4*>(C)[0] = C_fp32;
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  // RDNA4 WMMA path (32-thread wavefront, 8 elements per thread)
+  static_assert(std::is_same_v<T, __half> || std::is_same_v<T, __hip_bfloat16>,
+                "T must be __half or __hip_bfloat16");
+
+  if constexpr (mma_mode == mma::MMAMode::kInit) {
+    C[0] = 0.0f;
+    C[1] = 0.0f;
+    C[2] = 0.0f;
+    C[3] = 0.0f;
+    C[4] = 0.0f;
+    C[5] = 0.0f;
+    C[6] = 0.0f;
+    C[7] = 0.0f;
+  }
+
+  f16x8 B_fp16 = reinterpret_cast<f16x8*>(B)[0];
+  f16x8 A_fp16 = reinterpret_cast<f16x8*>(A)[0];
+  f32x8 C_fp32 = reinterpret_cast<f32x8*>(C)[0];
+
+  if constexpr (std::is_same_v<T, __half>) {
+    C_fp32 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(A_fp16, B_fp16, C_fp32);
+  } else if constexpr (std::is_same_v<T, __hip_bfloat16>) {
+    C_fp32 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(A_fp16, B_fp16, C_fp32);
+  }
+
+  reinterpret_cast<f32x8*>(C)[0] = C_fp32;
 #elif defined(__HIP_DEVICE_COMPILE__)
-#error "Unsupported GFX platform for MFMA ops."
+#error "Unsupported GFX platform for MMA ops."
 #endif
 }
 
-/// @brief Loads a fragment from LDS to two 32bit registers and then transposes
-/// the registers for a group of four consecuitive threads.
-///
-/// transposes the values in four adjacent threads. The function does the
-/// following layout transformation:
-/// Original data in registers for Threads 0-3 after fragment load
-/// T0 : a b c d
-/// T1 : e f g h
-/// T2 : i j k l
-/// T3 : m n o p
-///
-/// After transposition:
-/// T0 : a e i m
-/// T1 : b f j n
-/// T2 : c g k o
-/// T3 : d h l p
+/// @note RDNA4 (WMMA): No transpose needed — WMMA intrinsics expect the same
+///          layout for both A and B operands, and the D (output) layout matches
+///          the B layout, so chained WMMA ops require no data shuffle.
 template <typename T>
 __device__ __forceinline__ void load_quad_transposed_fragment(uint32_t* R, const T* smem_ptr) {
   static_assert(std::is_same_v<T, __half>, "Only half type is supported");
   load_fragment(R, smem_ptr);
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx1201__)
+  // CDNA MFMA path: transpose for B-matrix layout
   transpose_intra_quad_fragments(R);
+#endif
+  // RDNA4 WMMA path: no-op, input layout matches expected layout
 }
 
-// TODO: Verify correct matrix multiplication order for rowsum on CDNA3
-// Current assumption: s_frag × ones_vector = row_sums
-// Need to validate:
-// 1. How compute_qk stores Q×K^T result in s_frag for CDNA3
-// 2. Whether K is pre-transposed or transposed during fragment loading
-// 3. If we need s_frag × M1 or M1 × s_frag for correct row sums
-//
-// Test with known input matrices to verify:
-// - s_frag layout matches expected Q×K^T result
-// - rowsum produces correct per-row sums
+// TODO: Verify correct matrix multiplication order for rowsum on RDNA4 WMMA
+// Same as CDNA3: s_frag × ones_vector = row_sums. WMMA output layout matches
+// input layout, so no transpose is needed before the WMMA rowsum call.
 template <typename DType>
 __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag) {
   static_assert(sizeof(DType) == 2, "DType must be 16-bit type");
   static_assert(std::is_same_v<DType, __half> || std::is_same_v<DType, __hip_bfloat16>,
                 "DType must be __half or __hip_bfloat16");
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+  // RDNA4 WMMA: 8 elements per thread, no transpose needed
+  f16x8 a = reinterpret_cast<const f16x8*>(s_frag)[0];
+  f32x8 c = {d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]};
+  f32x8 out;
+
+  if constexpr (std::is_same_v<DType, __half>) {
+    f16x8 b = {f16(1.0f), f16(1.0f), f16(1.0f), f16(1.0f),
+               f16(1.0f), f16(1.0f), f16(1.0f), f16(1.0f)};
+    out = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+  } else if constexpr (std::is_same_v<DType, __hip_bfloat16>) {
+    constexpr uint32_t bf16_one_pair = 0x3F803F80u;
+    constexpr uint64_t bf16_ones = (uint64_t{bf16_one_pair} << 32) | bf16_one_pair;
+    f16x8 b = {reinterpret_cast<const f16x4*>(&bf16_ones)[0],
+               reinterpret_cast<const f16x4*>(&bf16_ones)[0]};
+    out = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+  }
+
+  d[0] = out.x;
+  d[1] = out.y;
+  d[2] = out.z;
+  d[3] = out.w;
+  d[4] = reinterpret_cast<const float*>(&out)[4];
+  d[5] = reinterpret_cast<const float*>(&out)[5];
+  d[6] = reinterpret_cast<const float*>(&out)[6];
+  d[7] = reinterpret_cast<const float*>(&out)[7];
+#else
+  // CDNA MFMA: 4 elements per thread, 64-thread wavefront
   f16x4 a = reinterpret_cast<const f16x4*>(s_frag)[0];
   f32x4 c = {d[0], d[1], d[2], d[3]};
   f32x4 out;
@@ -220,7 +272,7 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
     f16x4 b = {f16(1.0f), f16(1.0f), f16(1.0f), f16(1.0f)};
     out = __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, c, 0, 0, 0);
   } else if constexpr (std::is_same_v<DType, __hip_bfloat16>) {
-    constexpr uint32_t bf16_one_pair = 0x3F803F80u;  // two bf16 1.0 values packed
+    constexpr uint32_t bf16_one_pair = 0x3F803F80u;
     constexpr uint64_t bf16_ones = (uint64_t{bf16_one_pair} << 32) | bf16_one_pair;
     f16x4 b = std::bit_cast<f16x4>(bf16_ones);
     out = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, 0, 0, 0);
@@ -230,6 +282,7 @@ __device__ __forceinline__ void m16k16_rowsum_f16f16f32(float* d, DType* s_frag)
   d[1] = out.y;
   d[2] = out.z;
   d[3] = out.w;
+#endif
 }
 
 // TODO (rimaddur) : After release 2025.08

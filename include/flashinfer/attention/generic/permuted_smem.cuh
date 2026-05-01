@@ -196,7 +196,14 @@ struct smem_t {
   __device__ __forceinline__ void load_fragment(uint32_t offset, T* frag) {
 #if defined(PLATFORM_HIP_DEVICE)
     static_assert(sizeof(T) == 4, "Only 32-bit fragment loading supported");
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+    // RDNA4 WMMA: 8 fp16 elements per thread = 4 uint32_t
+    reinterpret_cast<uint2*>(frag)[0] = reinterpret_cast<const uint2*>(base + offset)[0];
+    reinterpret_cast<uint2*>(frag)[1] = reinterpret_cast<const uint2*>(base + offset)[1];
+#else
+    // CDNA MFMA: 4 fp16 elements per thread = 2 uint32_t
     reinterpret_cast<uint2*>(frag)[0] = *reinterpret_cast<const uint2*>(base + offset);
+#endif
 #else
     ldmatrix_m8n8x4(offset, frag);
 #endif
@@ -247,7 +254,12 @@ struct smem_t {
   __device__ __forceinline__ void store_fragment(uint32_t offset, const T* frag) {
 #if defined(PLATFORM_HIP_DEVICE)
     static_assert(sizeof(T) == 4, "Only 32-bit fragment storing supported");
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+    reinterpret_cast<uint2*>(base + offset)[0] = reinterpret_cast<const uint2*>(frag)[0];
+    reinterpret_cast<uint2*>(base + offset)[1] = reinterpret_cast<const uint2*>(frag)[1];
+#else
     *reinterpret_cast<uint2*>(base + offset) = reinterpret_cast<const uint2*>(frag)[0];
+#endif
 #else
     stmatrix_m8n8x4(offset, frag);
 #endif

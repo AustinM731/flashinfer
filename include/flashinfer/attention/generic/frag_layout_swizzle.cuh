@@ -13,7 +13,14 @@
 #if defined(PLATFORM_CUDA_DEVICE)
 constexpr uint32_t WARP_FULL_MASK = 0xffffffff;  // 32-bit mask for CUDA
 #elif defined(PLATFORM_HIP_DEVICE)
-constexpr uint64_t WARP_FULL_MASK = 0xffffffffffffffffULL;  // 64-bit mask for HIP
+#if defined(__gfx1201__)
+// RDNA4 (gfx1201): 32-thread wavefront — only lower 32 bits relevant
+constexpr uint64_t WARP_FULL_MASK = 0x00000000ffffffffULL;
+#else
+// CDNA: 64-thread wavefront — full 64 bits
+constexpr uint64_t WARP_FULL_MASK = 0xffffffffffffffffULL;
+#endif
+#endif
 #endif
 
 __device__ __forceinline__ uint32_t frag_layout_swizzle_16b_to_8b(uint32_t x) {

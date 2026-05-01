@@ -37,10 +37,13 @@ __device__ __forceinline__ void load_fragment(uint32_t* R, const T* smem_ptr) {
  * \brief Performs a full 16x16 in-register matrix transpose for CDNA3 MFMA tiles
  * \details Converts between A-matrix layout (row-major) and B/C/D-matrix layout (column-major)
  *          by combining intra-quad and inter-quad fragment transpositions.
- * \param R Pointer to 2 uint32_t registers containing the fragment data
+ * \note For RDNA4 WMMA, this is a no-op because WMMA input and output layouts are identical.
+ * \param R Pointer to fragment registers (2 uint32_t for CDNA, 4 uint32_t for RDNA4)
  */
 __device__ __forceinline__ void transpose_mma_tile(uint32_t* R) {
+#if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx1201__)
   mma_detail::transpose_mma_tile(R);
+#endif
 }
 #endif
 

@@ -5,7 +5,7 @@
 import functools
 
 # AMDGPU archs supported by amd-flashinfer
-FLASHINFER_SUPPORTED_ROCM_ARCHS = ["gfx942", "gfx950"]
+FLASHINFER_SUPPORTED_ROCM_ARCHS = ["gfx942", "gfx950", "gfx1201"]
 
 
 def get_rocm_home():
