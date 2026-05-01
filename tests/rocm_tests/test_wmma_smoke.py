@@ -11,13 +11,8 @@ Usage (inside a gfx1201 container):
 import torch
 
 
-def test_wmma_gem_16x16x16_smoke():
-    """Verify FlashInfer JIT compilation of a single-decode kernel on gfx1201.
-
-    This test triggers JIT compilation of the decode kernel (which exercises
-    the WMMA intrinsics path in mma_hip.h) and checks that it produces valid
-    output. It is intentionally small and fast.
-    """
+def test_wmma_gemm_16x16x16_smoke():
+    """Verify FlashInfer JIT compilation of a single-decode kernel on gfx1201."""
     assert torch.cuda.is_available() and torch.cuda.get_device_properties(
         0
     ).gcnArchName.startswith("gfx1201"), (
@@ -26,7 +21,6 @@ def test_wmma_gem_16x16x16_smoke():
 
     import flashinfer
 
-    # Build a minimal paged KV cache and query to trigger the decode kernel.
     batch_size = 2
     num_heads_q = 4
     num_heads_kv = 4
@@ -37,78 +31,79 @@ def test_wmma_gem_16x16x16_smoke():
     dtype = torch.float16
     device = "cuda:0"
 
-    # Query: (batch_size, num_heads_q, head_dim)
     q = torch.randn(
         (batch_size, num_heads_q, head_dim),
         dtype=dtype,
         device=device,
     )
 
-    # KV cache: (num_blocks, 2, block_size, num_heads_kv, head_dim)
-    num_blocks = seq_len  # 1 block per sequence
+    # Each request uses exactly one page. page i -> request i.
+    # kv_cache shape: (num_blocks, 2, block_size, num_heads_kv, head_dim) NHD
+    total_blocks = batch_size
     kv_cache = torch.randn(
-        (num_blocks, 2, block_size, num_heads_kv, head_dim),
+        (total_blocks, 2, block_size, num_heads_kv, head_dim),
         dtype=dtype,
         device=device,
     )
 
-    # Key/query for decode (single token per sequence)
-    k = torch.randn(
-        (batch_size, num_heads_kv, head_dim),
-        dtype=dtype,
-        device=device,
-    )
-    v = torch.randn(
-        (batch_size, num_heads_kv, head_dim),
-        dtype=dtype,
-        device=device,
-    )
-
-    # Create decode wrapper & plan
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(workspace, "NHD")
 
-    # Block table: (batch_size, max_num_blocks)
-    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).reshape(
-        1, -1
-    ).repeat(batch_size, 1)
+    # paged_kv_indptr: cumulative page count [0, 1, 2] (one page per request)
+    paged_kv_indptr = torch.tensor(
+        [0, 1, 2], dtype=torch.int32, device="cpu"
+    )
+    # paged_kv_indices: one block per request [0, 1]
+    paged_kv_indices = torch.arange(total_blocks, dtype=torch.int32)
+    # last_page_len: 16 tokens per page
+    last_page_len = torch.full(
+        (batch_size,), seq_len, dtype=torch.int32, device="cpu"
+    )
 
-    # Last page length: (batch_size,) — each seq has 1 page of 16 tokens
-    last_page_len = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cpu")
-
+    # Decode plan is positional: (indptr, indices, last_page_len, ...)
     wrapper.plan(
-        qo_indptr=torch.tensor([0, batch_size], dtype=torch.int32, device="cpu"),
-        paged_kv_indptr=torch.tensor(
-            [0, 1, 2], dtype=torch.int32, device="cpu"
-        ),
-        paged_kv_indices=block_table.reshape(-1),
-        paged_kv_last_page_len=last_page_len,
-        num_qo_heads=num_heads_q,
-        num_kv_heads=num_heads_kv,
-        head_dim_qk=head_dim,
-        page_size=block_size,
-        causal=True,
+        paged_kv_indptr,
+        paged_kv_indices,
+        last_page_len,
+        num_heads_q,
+        num_heads_kv,
+        head_dim,
+        block_size,
         sm_scale=head_dim ** -0.5,
-        window_left=-1,
         logits_soft_cap=0.0,
         q_data_type=dtype,
         kv_data_type=dtype,
-        o_data_type=dtype,
     )
 
-    # Run decode — this triggers JIT compilation of the WMMA kernel
-    o = torch.empty(
-        (batch_size, num_heads_q, head_dim),
-        dtype=dtype,
-        device=device,
+    # Run decode — triggers JIT compilation of the WMMA kernel
+    paged_kv_cache = (kv_cache[:, 0], kv_cache[:, 1])
+    o = wrapper.run(q, paged_kv_cache)
+
+    assert torch.isfinite(o).all(), "Decode output contains NaN or Inf"
+    assert (o.abs() > 1e-8).any(), "Decode output is all zeros"
+
+    # CPU/GPU SDPA reference — per-request, 3-D format (seq, heads, dim).
+    # Decode: one query token attends to all seq_len KV entries unmasked.
+    # We use is_causal=False to explicitly match this. is_causal=True would be
+    # fragile across PyTorch versions (top-left vs bottom-right alignment).
+    attn_scale = head_dim ** -0.5
+    o_ref_list = []
+    for i in range(batch_size):
+        k_i = kv_cache[i, 0]  # (block_size, num_heads_kv, head_dim)
+        v_i = kv_cache[i, 1]
+        q_i = q[i].unsqueeze(0)  # (1, num_heads_q, head_dim)
+        o_i_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_i, k_i, v_i, is_causal=False, scale=attn_scale,
+        )  # (1, heads, dim)
+        o_ref_list.append(o_i_ref)
+    o_ref = torch.cat(o_ref_list, dim=0)  # (batch, heads, dim)
+
+    assert torch.allclose(o, o_ref, atol=1e-2, rtol=1e-1), (
+        f"Decode output mismatch with SDPA reference: max diff={
+            (o - o_ref).abs().max().item():.4f}"
     )
-    wrapper.run(q, k, v, kv_cache[:, 0], kv_cache[:, 1], o)
 
-    # Basic sanity: output should be finite and non-zero
-    assert torch.isfinite(o).all(), "Output contains NaN or Inf"
-    assert (o.abs() > 1e-8).any(), "Output is all zeros — possible no-op or broken kernel"
-
-    print(f"WMMA decode kernel smoke test PASSED — output shape {o.shape}, dtype {o.dtype}")
+    print(f"WMMA decode kernel smoke test PASSED — shape {o.shape}, dtype {o.dtype}")
 
 
 def test_wmma_prefill_smoke():
@@ -131,27 +126,17 @@ def test_wmma_prefill_smoke():
     dtype = torch.float16
     device = "cuda:0"
 
-    # Query: (batch_size * seq_len, num_heads_q, head_dim) for ragged
-    # Using paged prefill instead:
+    total_tokens = batch_size * seq_len
     q = torch.randn(
-        (batch_size * seq_len, num_heads_q, head_dim),
-        dtype=dtype,
-        device=device,
-    )
-    k = torch.randn(
-        (batch_size * seq_len, num_heads_kv, head_dim),
-        dtype=dtype,
-        device=device,
-    )
-    v = torch.randn(
-        (batch_size * seq_len, num_heads_kv, head_dim),
+        (total_tokens, num_heads_q, head_dim),
         dtype=dtype,
         device=device,
     )
 
-    num_blocks = (batch_size * seq_len) // block_size  # total blocks
+    blocks_per_seq = seq_len // block_size
+    total_blocks = batch_size * blocks_per_seq
     kv_cache = torch.randn(
-        (num_blocks, 2, block_size, num_heads_kv, head_dim),
+        (total_blocks, 2, block_size, num_heads_kv, head_dim),
         dtype=dtype,
         device=device,
     )
@@ -159,45 +144,46 @@ def test_wmma_prefill_smoke():
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(workspace, "NHD")
 
-    # qo_indptr: cumulative token count per sequence
+    # qo_indptr: cumulative token count per sequence [0, seq_len, 2*seq_len]
     qo_indptr = torch.tensor(
-        [0, seq_len, batch_size * seq_len], dtype=torch.int32, device="cpu"
+        [0, seq_len, total_tokens], dtype=torch.int32, device="cpu"
     )
 
-    # block table: (batch_size, blocks_per_seq)
-    blocks_per_seq = seq_len // block_size
-    block_table = torch.arange(num_blocks, dtype=torch.int32).reshape(
-        batch_size, blocks_per_seq
-    ).to(device)
+    # paged_kv_indptr: cumulative block count [0, blocks_per_seq, 2*blocks_per_seq]
+    paged_kv_indptr = torch.tensor(
+        [0, blocks_per_seq, 2 * blocks_per_seq],
+        dtype=torch.int32,
+        device="cpu",
+    )
 
+    # paged_kv_indices: contiguous block IDs
+    paged_kv_indices = torch.arange(total_blocks, dtype=torch.int32)
+    paged_kv_last_page_len = torch.full(
+        (batch_size,), block_size, dtype=torch.int32, device="cpu"
+    )
+
+    # Prefill plan is positional: (qo_indptr, paged_kv_indptr, paged_kv_indices, ...)
     wrapper.plan(
-        qo_indptr=qo_indptr,
-        paged_kv_indptr=torch.tensor(
-            [0, blocks_per_seq, 2 * blocks_per_seq],
-            dtype=torch.int32,
-            device="cpu",
-        ),
-        paged_kv_indices=block_table.reshape(-1),
-        paged_kv_last_page_len=torch.full(
-            (batch_size,), block_size, dtype=torch.int32, device="cpu"
-        ),
-        num_qo_heads=num_heads_q,
-        num_kv_heads=num_heads_kv,
-        head_dim_qk=head_dim,
-        page_size=block_size,
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        num_heads_q,
+        num_heads_kv,
+        head_dim,
+        block_size,
         causal=True,
         sm_scale=head_dim ** -0.5,
-        window_left=-1,
         logits_soft_cap=0.0,
         q_data_type=dtype,
         kv_data_type=dtype,
-        o_data_type=dtype,
     )
 
-    o = torch.empty_like(q)
-    wrapper.run(q, k, v, kv_cache[:, 0], kv_cache[:, 1], o)
+    paged_kv_cache = (kv_cache[:, 0], kv_cache[:, 1])
+    o = wrapper.run(q, paged_kv_cache)
 
     assert torch.isfinite(o).all(), "Prefill output contains NaN or Inf"
     assert (o.abs() > 1e-8).any(), "Prefill output is all zeros"
 
-    print(f"WMMA prefill kernel smoke test PASSED — output shape {o.shape}, dtype {o.dtype}")
+    print(f"WMMA prefill kernel smoke test PASSED — shape {o.shape}, dtype {o.dtype}")
+

@@ -10,9 +10,12 @@ vLLM AttentionBackend protocol. Only supports the core decode + prefill path
 """
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
+
+import triton
+import triton.language as tl
 
 from vllm.config.cache import CacheDType
 from vllm.config import CUDAGraphMode, VllmConfig
@@ -333,21 +336,20 @@ class RocmFlashInferMetadataBuilder(
 
             prefill_wrapper = self._get_prefill_wrapper()
             prefill_wrapper.plan(
-                qo_indptr=qo_indptr_prefill_cpu,
-                paged_kv_indptr=paged_kv_indptr_prefill_cpu,
-                paged_kv_indices=paged_kv_indices,
-                paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
-                num_qo_heads=self.num_qo_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_dim,
-                page_size=page_size,
+                qo_indptr_prefill_cpu,
+                paged_kv_indptr_prefill_cpu,
+                paged_kv_indices,
+                paged_kv_last_page_len_prefill_cpu,
+                self.num_qo_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                page_size,
                 causal=True,
                 sm_scale=self.sm_scale,
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap or 0.0,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.kv_cache_dtype,
-                o_data_type=self.model_config.dtype,
             )
             attn_metadata.prefill_wrapper = prefill_wrapper
 
@@ -375,19 +377,10 @@ class RocmFlashInferMetadataBuilder(
                 logits_soft_cap=self.logits_soft_cap or 0.0,
                 q_data_type=self.q_data_type,
                 kv_data_type=self.kv_cache_dtype,
-                o_data_type=self.model_config.dtype,
             )
             attn_metadata.decode_wrapper = decode_wrapper
 
         return attn_metadata
-
-
-# ---------------------------------------------------------------------------
-# Triton kernel for page index copying (same as upstream Triton backend)
-# ---------------------------------------------------------------------------
-
-import triton
-import triton.language as tl
 
 
 @triton.jit
@@ -404,9 +397,8 @@ def _copy_page_indices_kernel(
     num_pages = end_idx - start_idx
 
     offsets = tl.arange(0, BLOCK_SIZE)
-    mask = offsets < num_pages
 
-    for i in tl.cdiv(num_pages, BLOCK_SIZE):
+    for i in range(tl.cdiv(num_pages, BLOCK_SIZE)):
         block_offsets = i * BLOCK_SIZE + offsets
         mask_block = block_offsets < num_pages
         block_idx = tl.load(
@@ -419,13 +411,8 @@ def _copy_page_indices_kernel(
             mask=mask_block,
         )
 
-
-# ---------------------------------------------------------------------------
-# Fast plan decode (from upstream FlashInfer backend pattern)
-# ---------------------------------------------------------------------------
-
 def fast_plan_decode(
-    decode_wrapper,
+    decode_wrapper: Any,
     indptr_cpu: torch.Tensor,
     indices: torch.Tensor,
     last_page_len_cpu: torch.Tensor,
@@ -439,25 +426,21 @@ def fast_plan_decode(
     logits_soft_cap: float,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
-    o_data_type: torch.dtype,
-):
+) -> None:
     decode_wrapper.plan(
-        qo_indptr=indptr_cpu,
-        paged_kv_indptr=indptr_cpu,
-        paged_kv_indices=indices,
-        paged_kv_last_page_len=last_page_len_cpu,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim,
-        page_size=page_size,
-        causal=True,
+        indptr_cpu,
+        indices,
+        last_page_len_cpu,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode=pos_encoding_mode,
         sm_scale=sm_scale,
         window_left=window_left,
         logits_soft_cap=logits_soft_cap,
-        pos_encoding_mode=pos_encoding_mode,
         q_data_type=q_data_type,
         kv_data_type=kv_data_type,
-        o_data_type=o_data_type,
     )
 
 
@@ -629,45 +612,32 @@ class RocmFlashInferImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
-
-        key_cache, value_cache = kv_cache.unbind(1)
+        # FlashInfer run() takes (q, paged_kv_cache, *, out=o)
+        # where paged_kv_cache = (k_cache, v_cache), each with shape
+        # (num_blocks, block_size, num_kv_heads, head_size) for NHD.
+        k_cache = kv_cache[:, 0]
+        v_cache = kv_cache[:, 1]
+        paged_kv_cache = (k_cache, v_cache)
 
         # ---- PREFILL ----
         if attn_metadata.num_prefills > 0:
-            prefill_wrapper = attn_metadata.prefill_wrapper
+            prefill_wrapper: Any = attn_metadata.prefill_wrapper
             prefill_start = attn_metadata.num_decode_tokens
+            num_actual_tokens = attn_metadata.num_actual_tokens
 
             q_prefill = query[prefill_start:num_actual_tokens]
-            k_prefill = key[prefill_start:num_actual_tokens]
-            v_prefill = value[prefill_start:num_actual_tokens]
             o_prefill = output[prefill_start:num_actual_tokens]
 
-            prefill_wrapper.run(
-                q_prefill,
-                k_prefill,
-                v_prefill,
-                key_cache,
-                value_cache,
-                o_prefill,
-            )
+            prefill_wrapper.run(q_prefill, paged_kv_cache, out=o_prefill)
 
         # ---- DECODE ----
         if attn_metadata.num_decodes > 0:
-            decode_wrapper = attn_metadata.decode_wrapper
+            decode_wrapper: Any = attn_metadata.decode_wrapper
+            num_decode = attn_metadata.num_decode_tokens
 
-            q_decode = query[:attn_metadata.num_decode_tokens]
-            k_decode = key[:attn_metadata.num_decode_tokens]
-            v_decode = value[:attn_metadata.num_decode_tokens]
-            o_decode = output[:attn_metadata.num_decode_tokens]
+            q_decode = query[:num_decode]
+            o_decode = output[:num_decode]
 
-            decode_wrapper.run(
-                q_decode,
-                k_decode,
-                v_decode,
-                key_cache,
-                value_cache,
-                o_decode,
-            )
+            decode_wrapper.run(q_decode, paged_kv_cache, out=o_decode)
 
         return output
