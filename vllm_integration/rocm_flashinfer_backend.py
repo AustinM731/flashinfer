@@ -647,3 +647,47 @@ class RocmFlashInferImpl(AttentionImpl):
             decode_wrapper.run(q_decode, paged_kv_cache, out=o_decode)
 
         return output
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write incoming key/value tensors into the paged KV cache.
+
+        vLLM's torch.compile pass emits a `unified_kv_cache_update` side-effect
+        op before each attention forward when
+        `forward_includes_kv_cache_update == False`. The op asserts that the
+        impl exposes `do_kv_cache_update`, then routes the K/V writeback here.
+        Without this hook, CUDA graph capture / compiled forward fails with
+        "RocmFlashInferImpl does not support kv cache update".
+
+        Mirrors the upstream FlashInferImpl path: reshape_and_cache_flash is
+        the same vLLM C++ op that the standard FLASH_ATTN/FLASHINFER backends
+        use, and is registered in vLLM's ROCm build via vllm/_C.
+        """
+        if self.kv_sharing_target_layer_name is not None:
+            # KV cache is shared from an earlier layer — nothing to write.
+            return
+
+        # KV cache layout: (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # See RocmFlashInferBackend.get_kv_cache_shape().
+        k_cache = kv_cache[:, 0]
+        v_cache = kv_cache[:, 1]
+
+        # NOTE: key/value may be padded; reshape_and_cache_flash uses
+        # slot_mapping.shape to determine the count of actual tokens, so
+        # passing the unsliced tensors is correct.
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
