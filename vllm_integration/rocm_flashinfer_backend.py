@@ -467,7 +467,13 @@ class RocmFlashInferBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "FLASHINFER_ROCM"
+        # Must match the AttentionBackendEnum slot this class is registered
+        # against. patch_flashinfer_backend() in apply_rdna4_patches.py
+        # registers RocmFlashInferBackend at AttentionBackendEnum.FLASHINFER,
+        # and vLLM resolves the enum via AttentionBackendEnum[get_name()] in
+        # vllm/model_executor/layers/attention/attention.py — so returning
+        # "FLASHINFER_ROCM" raises "Unknown attention backend".
+        return "FLASHINFER"
 
     @staticmethod
     def get_impl_cls() -> type["RocmFlashInferImpl"]:
